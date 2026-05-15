@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>claude.json</title>
+<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+<script src="https://unpkg.com/lucide@latest"></script>
+<style type="text/tailwindcss">
+  @theme {
+    --color-bg: #ffffff;
+    --color-fg: #0b0a0f;
+    --color-muted: #6b6375;
+    --color-border: #e5e4e7;
+    --color-card: #fafafa;
+    --color-accent: #aa3bff;
+    --color-accent-fg: #ffffff;
+    --color-danger: #dc2626;
+    --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    @theme {
+      --color-bg: #0e0f14;
+      --color-fg: #f3f4f6;
+      --color-muted: #9ca3af;
+      --color-border: #2e303a;
+      --color-card: #16171d;
+      --color-accent: #c084fc;
+      --color-accent-fg: #0e0f14;
+      --color-danger: #ef4444;
+    }
+  }
+</style>
+<style>
+  html, body { margin: 0; padding: 0; }
+  body { font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; -webkit-font-smoothing: antialiased; }
+  .mono, code, pre { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  [data-icon] { display: inline-block; vertical-align: middle; }
+</style>
+</head>
+<body class="h-screen w-screen overflow-hidden bg-bg text-fg">
+  <div id="root"></div>
+  <script src="app.js" type="module"></script>
+</body>
+</html>

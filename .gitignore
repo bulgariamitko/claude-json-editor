@@ -1,0 +1,25 @@
+# Rust / Cargo
+src-tauri/target/
+src-tauri/gen/
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Tauri signing keys — must NEVER be committed
+_signing_key.private
+_signing_key.private.pub
+*.key
+*.pem
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS / build artifacts
+*.log
