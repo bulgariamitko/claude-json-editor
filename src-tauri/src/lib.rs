@@ -23,6 +23,50 @@ fn settings_path() -> PathBuf {
 fn skills_dir() -> PathBuf {
     home().join(".claude").join("skills")
 }
+fn sessions_root() -> PathBuf {
+    home().join(".claude").join("projects")
+}
+
+fn encode_project_path(path: &str) -> String {
+    path.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+fn extract_first_user_prompt(jsonl: &str) -> Option<String> {
+    for line in jsonl.lines() {
+        let v: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if v.get("type").and_then(|t| t.as_str()) != Some("user") {
+            continue;
+        }
+        let content = v.get("message").and_then(|m| m.get("content"))?;
+        let text = if let Some(s) = content.as_str() {
+            s.to_string()
+        } else if let Some(arr) = content.as_array() {
+            arr.iter()
+                .find_map(|b| {
+                    if b.get("type").and_then(|t| t.as_str()) == Some("text") {
+                        b.get("text").and_then(|t| t.as_str()).map(String::from)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let trimmed = text.trim();
+        if trimmed.is_empty() || trimmed.starts_with('<') {
+            continue;
+        }
+        let truncated: String = trimmed.chars().take(200).collect();
+        return Some(truncated);
+    }
+    None
+}
 
 fn ensure_backup_dir() -> std::io::Result<()> {
     let d = backup_dir();
@@ -473,6 +517,78 @@ fn skill_delete(args: SkillDeleteArgs) -> Result<Value, String> {
     Ok(serde_json::json!({ "ok": true }))
 }
 
+#[derive(Deserialize)]
+struct ListSessionsArgs {
+    path: String,
+}
+
+#[derive(Serialize)]
+struct SessionInfo {
+    id: String,
+    mtime: String,
+    #[serde(rename = "mtimeMs")]
+    mtime_ms: i64,
+    size: u64,
+    #[serde(rename = "firstPrompt")]
+    first_prompt: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ListSessionsResult {
+    #[serde(rename = "encodedDir")]
+    encoded_dir: String,
+    exists: bool,
+    items: Vec<SessionInfo>,
+}
+
+#[tauri::command]
+fn list_sessions(args: ListSessionsArgs) -> ListSessionsResult {
+    let encoded = encode_project_path(&args.path);
+    let dir = sessions_root().join(&encoded);
+    let encoded_dir = dir.to_string_lossy().into_owned();
+    if !dir.is_dir() {
+        return ListSessionsResult { encoded_dir, exists: false, items: Vec::new() };
+    }
+    let mut items = Vec::new();
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let id = match path.file_stem().and_then(|s| s.to_str()) {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let modified = meta.modified().ok();
+            let mtime_ms = modified
+                .as_ref()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            let mtime = modified
+                .map(|t| DateTime::<Local>::from(t).to_rfc3339_opts(SecondsFormat::Secs, false))
+                .unwrap_or_default();
+            let first_prompt = fs::read_to_string(&path)
+                .ok()
+                .and_then(|raw| extract_first_user_prompt(&raw));
+            items.push(SessionInfo {
+                id,
+                mtime,
+                mtime_ms,
+                size: meta.len(),
+                first_prompt,
+            });
+        }
+    }
+    items.sort_by(|a, b| b.mtime_ms.cmp(&a.mtime_ms));
+    ListSessionsResult { encoded_dir, exists: true, items }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -492,6 +608,7 @@ pub fn run() {
             skill_read,
             skill_write,
             skill_delete,
+            list_sessions,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
