@@ -185,6 +185,8 @@ struct Meta {
     skills_dir: String,
     #[serde(rename = "maxBackups")]
     max_backups: usize,
+    #[serde(rename = "appVersion")]
+    app_version: String,
     #[serde(rename = "runtime")]
     runtime: String,
 }
@@ -197,6 +199,7 @@ fn meta() -> Meta {
         settings_path: settings_path().to_string_lossy().into_owned(),
         skills_dir: skills_dir().to_string_lossy().into_owned(),
         max_backups: MAX_BACKUPS,
+        app_version: env!("CARGO_PKG_VERSION").to_string(),
         runtime: format!("tauri {}", env!("CARGO_PKG_VERSION")),
     }
 }
