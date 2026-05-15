@@ -593,6 +593,165 @@ fn list_sessions(args: ListSessionsArgs) -> ListSessionsResult {
 }
 
 #[derive(Deserialize)]
+struct DeleteSessionArgs {
+    path: String,
+    #[serde(rename = "sessionId")]
+    session_id: String,
+}
+
+#[tauri::command]
+fn delete_session(args: DeleteSessionArgs) -> Result<Value, String> {
+    if !args.session_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return Err("Invalid session id".into());
+    }
+    let encoded = encode_project_path(&args.path);
+    let file = sessions_root().join(&encoded).join(format!("{}.jsonl", args.session_id));
+    if !file.is_file() {
+        return Err("Session file not found".into());
+    }
+    // Move to backup dir instead of hard delete, so a mistake is recoverable.
+    let _ = ensure_backup_dir();
+    let backup_name = format!("session-{}-{}.jsonl", args.session_id, now_stamp());
+    let backup_path = backup_dir().join(&backup_name);
+    let bytes = fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
+    fs::copy(&file, &backup_path).map_err(|e| format!("backup failed: {e}"))?;
+    fs::remove_file(&file).map_err(|e| format!("delete failed: {e}"))?;
+    // If a sidecar dir exists (Claude Code sometimes stores per-session aux files), remove it too.
+    let sidecar_dir = sessions_root().join(&encoded).join(&args.session_id);
+    if sidecar_dir.is_dir() {
+        let _ = fs::remove_dir_all(&sidecar_dir);
+    }
+    Ok(serde_json::json!({
+        "ok": true,
+        "backup": backup_name,
+        "bytes": bytes,
+    }))
+}
+
+#[derive(Deserialize)]
+struct ListProjectImagesArgs {
+    path: String,
+    #[serde(rename = "maxImages")]
+    max_images: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct ProjectImage {
+    #[serde(rename = "sessionId")]
+    session_id: String,
+    #[serde(rename = "lineNo")]
+    line_no: usize,
+    #[serde(rename = "mtimeMs")]
+    mtime_ms: i64,
+    role: Option<String>,
+    #[serde(rename = "mediaType")]
+    media_type: String,
+    data: String,
+}
+
+#[derive(Serialize)]
+struct ListProjectImagesResult {
+    images: Vec<ProjectImage>,
+    truncated: bool,
+    #[serde(rename = "sessionsScanned")]
+    sessions_scanned: usize,
+}
+
+fn collect_images_from_line(
+    line: &str,
+    line_no: usize,
+    session_id: &str,
+    mtime_ms: i64,
+    out: &mut Vec<ProjectImage>,
+    limit: usize,
+) -> bool {
+    let v: Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let role = v.get("message").and_then(|m| m.get("role")).and_then(|r| r.as_str()).map(String::from);
+    let content = match v.get("message").and_then(|m| m.get("content")) {
+        Some(c) => c,
+        None => return false,
+    };
+    let blocks = match content.as_array() {
+        Some(a) => a,
+        None => return false,
+    };
+    let mut stop = false;
+    for b in blocks {
+        if b.get("type").and_then(|t| t.as_str()) != Some("image") { continue; }
+        let src = match b.get("source") {
+            Some(s) => s,
+            None => continue,
+        };
+        if src.get("type").and_then(|t| t.as_str()) != Some("base64") { continue; }
+        let media_type = src.get("media_type").and_then(|t| t.as_str()).unwrap_or("image/png").to_string();
+        let data = match src.get("data").and_then(|d| d.as_str()) {
+            Some(d) => d.to_string(),
+            None => continue,
+        };
+        out.push(ProjectImage {
+            session_id: session_id.to_string(),
+            line_no,
+            mtime_ms,
+            role: role.clone(),
+            media_type,
+            data,
+        });
+        if out.len() >= limit {
+            stop = true;
+            break;
+        }
+    }
+    stop
+}
+
+#[tauri::command]
+fn list_project_images(args: ListProjectImagesArgs) -> ListProjectImagesResult {
+    let limit = args.max_images.unwrap_or(200);
+    let encoded = encode_project_path(&args.path);
+    let dir = sessions_root().join(&encoded);
+    let mut images: Vec<ProjectImage> = Vec::new();
+    let mut sessions_scanned = 0usize;
+    let mut truncated = false;
+    if !dir.is_dir() {
+        return ListProjectImagesResult { images, truncated, sessions_scanned };
+    }
+    let mut files: Vec<(PathBuf, i64, String)> = Vec::new();
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for f in entries.flatten() {
+            let p = f.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("jsonl") { continue; }
+            let id = match p.file_stem().and_then(|s| s.to_str()) {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            let meta = match f.metadata() { Ok(m) => m, Err(_) => continue };
+            let mtime_ms = meta.modified().ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as i64).unwrap_or(0);
+            files.push((p, mtime_ms, id));
+        }
+    }
+    // Newest sessions first so the freshest images appear first.
+    files.sort_by(|a, b| b.1.cmp(&a.1));
+    'outer: for (path, mtime_ms, id) in files {
+        sessions_scanned += 1;
+        let raw = match fs::read_to_string(&path) { Ok(s) => s, Err(_) => continue };
+        for (idx, line) in raw.lines().enumerate() {
+            if !line.contains("\"image\"") { continue; }
+            let stop = collect_images_from_line(line, idx + 1, &id, mtime_ms, &mut images, limit);
+            if stop {
+                truncated = true;
+                break 'outer;
+            }
+        }
+    }
+    ListProjectImagesResult { images, truncated, sessions_scanned }
+}
+
+#[derive(Deserialize)]
 struct SearchSessionsArgs {
     query: String,
     #[serde(rename = "maxResults")]
@@ -805,6 +964,8 @@ pub fn run() {
             skill_delete,
             list_sessions,
             search_sessions,
+            delete_session,
+            list_project_images,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
