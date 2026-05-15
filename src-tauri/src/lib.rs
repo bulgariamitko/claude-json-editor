@@ -592,6 +592,198 @@ fn list_sessions(args: ListSessionsArgs) -> ListSessionsResult {
     ListSessionsResult { encoded_dir, exists: true, items }
 }
 
+#[derive(Deserialize)]
+struct SearchSessionsArgs {
+    query: String,
+    #[serde(rename = "maxResults")]
+    max_results: Option<usize>,
+    #[serde(rename = "maxPerSession")]
+    max_per_session: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct SearchSnippet {
+    #[serde(rename = "lineNo")]
+    line_no: usize,
+    role: Option<String>,
+    before: String,
+    matched: String,
+    after: String,
+}
+
+#[derive(Serialize)]
+struct SearchHit {
+    #[serde(rename = "projectPath")]
+    project_path: Option<String>,
+    #[serde(rename = "encodedDir")]
+    encoded_dir: String,
+    #[serde(rename = "sessionId")]
+    session_id: String,
+    mtime: String,
+    #[serde(rename = "mtimeMs")]
+    mtime_ms: i64,
+    snippets: Vec<SearchSnippet>,
+}
+
+#[derive(Serialize)]
+struct SearchSessionsResult {
+    hits: Vec<SearchHit>,
+    #[serde(rename = "filesScanned")]
+    files_scanned: usize,
+    truncated: bool,
+}
+
+fn extract_text_content(line: &str) -> String {
+    let v: Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(_) => return line.to_string(),
+    };
+    let content = match v.get("message").and_then(|m| m.get("content")) {
+        Some(c) => c,
+        None => return line.to_string(),
+    };
+    if let Some(s) = content.as_str() {
+        return s.to_string();
+    }
+    if let Some(arr) = content.as_array() {
+        let mut out = String::new();
+        for b in arr {
+            if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                if !out.is_empty() {
+                    out.push_str("\n");
+                }
+                out.push_str(t);
+            }
+        }
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    line.to_string()
+}
+
+fn make_snippet(text: &str, lower_text: &str, q_lower: &str, line_no: usize, role: Option<String>) -> Option<SearchSnippet> {
+    let pos = lower_text.find(q_lower)?;
+    // map byte position from lower_text back to text (same length since to_lowercase mostly preserves byte len for ASCII)
+    // safer: clamp on char boundaries of original text
+    let mut start = pos;
+    while start > 0 && !text.is_char_boundary(start) { start -= 1; }
+    let mut end = pos + q_lower.len();
+    while end < text.len() && !text.is_char_boundary(end) { end += 1; }
+    let ctx = 80;
+    let mut before_start = start.saturating_sub(ctx);
+    while before_start > 0 && !text.is_char_boundary(before_start) { before_start -= 1; }
+    let mut after_end = (end + ctx).min(text.len());
+    while after_end < text.len() && !text.is_char_boundary(after_end) { after_end += 1; }
+    Some(SearchSnippet {
+        line_no,
+        role,
+        before: text[before_start..start].to_string(),
+        matched: text[start..end].to_string(),
+        after: text[end..after_end].to_string(),
+    })
+}
+
+#[tauri::command]
+fn search_sessions(args: SearchSessionsArgs) -> SearchSessionsResult {
+    let query = args.query.trim();
+    let max_results = args.max_results.unwrap_or(100);
+    let max_per_session = args.max_per_session.unwrap_or(3);
+    if query.is_empty() {
+        return SearchSessionsResult { hits: Vec::new(), files_scanned: 0, truncated: false };
+    }
+    let q_lower = query.to_lowercase();
+
+    // Build encoded->canonical map from .claude.json projects
+    let mut encoded_to_path: HashMap<String, String> = HashMap::new();
+    if let Ok(raw) = fs::read_to_string(config_path()) {
+        if let Ok(cfg) = serde_json::from_str::<Value>(&raw) {
+            if let Some(projects) = cfg.get("projects").and_then(|p| p.as_object()) {
+                for (path, _) in projects {
+                    encoded_to_path.insert(encode_project_path(path), path.clone());
+                }
+            }
+        }
+    }
+
+    let root = sessions_root();
+    let mut hits: Vec<SearchHit> = Vec::new();
+    let mut files_scanned = 0usize;
+    let mut truncated = false;
+    let dirs = match fs::read_dir(&root) {
+        Ok(d) => d,
+        Err(_) => return SearchSessionsResult { hits, files_scanned, truncated },
+    };
+    'outer: for dir_entry in dirs.flatten() {
+        let dir_path = dir_entry.path();
+        if !dir_path.is_dir() { continue; }
+        let encoded_dir = dir_entry.file_name().to_string_lossy().into_owned();
+        let project_path = encoded_to_path.get(&encoded_dir).cloned();
+        let files = match fs::read_dir(&dir_path) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        for f in files.flatten() {
+            let p = f.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("jsonl") { continue; }
+            files_scanned += 1;
+            let raw = match fs::read_to_string(&p) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let mut snippets: Vec<SearchSnippet> = Vec::new();
+            for (idx, line) in raw.lines().enumerate() {
+                if snippets.len() >= max_per_session { break; }
+                // Fast pre-check on the raw line (case-insensitive).
+                if !line.to_lowercase().contains(&q_lower) { continue; }
+                let v: Value = match serde_json::from_str(line) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let role = v.get("message").and_then(|m| m.get("role")).and_then(|r| r.as_str()).map(String::from);
+                // Skip non-conversation entries (snapshots, permission-mode markers, etc.)
+                let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                if typ != "user" && typ != "assistant" { continue; }
+                let text = extract_text_content(line);
+                let lower_text = text.to_lowercase();
+                if let Some(s) = make_snippet(&text, &lower_text, &q_lower, idx + 1, role) {
+                    snippets.push(s);
+                }
+            }
+            if snippets.is_empty() { continue; }
+            let id = match p.file_stem().and_then(|s| s.to_str()) {
+                Some(s) => s.to_string(),
+                None => continue,
+            };
+            let meta = match f.metadata() {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let modified = meta.modified().ok();
+            let mtime_ms = modified.as_ref()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as i64).unwrap_or(0);
+            let mtime = modified
+                .map(|t| DateTime::<Local>::from(t).to_rfc3339_opts(SecondsFormat::Secs, false))
+                .unwrap_or_default();
+            hits.push(SearchHit {
+                project_path: project_path.clone(),
+                encoded_dir: encoded_dir.clone(),
+                session_id: id,
+                mtime,
+                mtime_ms,
+                snippets,
+            });
+            if hits.len() >= max_results {
+                truncated = true;
+                break 'outer;
+            }
+        }
+    }
+    hits.sort_by(|a, b| b.mtime_ms.cmp(&a.mtime_ms));
+    SearchSessionsResult { hits, files_scanned, truncated }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -612,6 +804,7 @@ pub fn run() {
             skill_write,
             skill_delete,
             list_sessions,
+            search_sessions,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
