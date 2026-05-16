@@ -593,6 +593,61 @@ fn list_sessions(args: ListSessionsArgs) -> ListSessionsResult {
 }
 
 #[derive(Deserialize)]
+struct OpenTerminalArgs {
+    path: String,
+}
+
+#[tauri::command]
+fn open_terminal(args: OpenTerminalArgs) -> Result<(), String> {
+    let path = args.path;
+    if path.is_empty() {
+        return Err("Empty path".into());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .args(["-a", "Terminal", &path])
+            .spawn()
+            .map_err(|e| format!("Failed to launch Terminal: {e}"))?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // `start cmd /K "cd /d <path>"` opens a new console at that directory.
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "cmd", "/K", &format!("cd /d \"{}\"", path)])
+            .spawn()
+            .map_err(|e| format!("Failed to launch cmd: {e}"))?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // Best-effort: try common terminal emulators in order.
+        let attempts: Vec<(&str, Vec<String>)> = vec![
+            ("gnome-terminal", vec![format!("--working-directory={}", path)]),
+            ("konsole",        vec!["--workdir".into(), path.clone()]),
+            ("xfce4-terminal", vec![format!("--working-directory={}", path)]),
+            ("alacritty",      vec!["--working-directory".into(), path.clone()]),
+            ("kitty",          vec!["--directory".into(), path.clone()]),
+            ("tilix",          vec!["--working-directory".into(), path.clone()]),
+            ("xterm",          vec!["-e".into(), format!("cd '{}' && exec $SHELL", path.replace('\'', "'\\''"))]),
+        ];
+        for (term, term_args) in attempts {
+            if std::process::Command::new(term).args(&term_args).spawn().is_ok() {
+                return Ok(());
+            }
+        }
+        return Err("No supported terminal emulator found (tried gnome-terminal, konsole, xfce4-terminal, alacritty, kitty, tilix, xterm)".into());
+    }
+
+    #[allow(unreachable_code)]
+    Err("Unsupported platform".into())
+}
+
+#[derive(Deserialize)]
 struct DeleteSessionArgs {
     path: String,
     #[serde(rename = "sessionId")]
@@ -966,6 +1021,7 @@ pub fn run() {
             search_sessions,
             delete_session,
             list_project_images,
+            open_terminal,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
