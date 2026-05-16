@@ -592,6 +592,187 @@ fn list_sessions(args: ListSessionsArgs) -> ListSessionsResult {
     ListSessionsResult { encoded_dir, exists: true, items }
 }
 
+#[derive(Serialize)]
+struct MemoryFile {
+    name: String,
+    size: u64,
+    mtime: String,
+    #[serde(rename = "mtimeMs")]
+    mtime_ms: i64,
+    frontmatter: Map<String, Value>,
+    #[serde(rename = "bodyPreview")]
+    body_preview: String,
+    #[serde(rename = "isIndex")]
+    is_index: bool,
+}
+
+#[derive(Serialize)]
+struct MemoryProject {
+    #[serde(rename = "projectPath")]
+    project_path: Option<String>,
+    #[serde(rename = "encodedDir")]
+    encoded_dir: String,
+    #[serde(rename = "dirPath")]
+    dir_path: String,
+    #[serde(rename = "dirMtimeMs")]
+    dir_mtime_ms: i64,
+    files: Vec<MemoryFile>,
+}
+
+#[derive(Serialize)]
+struct ListMemoriesResult {
+    projects: Vec<MemoryProject>,
+}
+
+#[tauri::command]
+fn list_memories() -> ListMemoriesResult {
+    let root = sessions_root();
+    // Build encoded->canonical map.
+    let mut encoded_to_path: HashMap<String, String> = HashMap::new();
+    if let Ok(raw) = fs::read_to_string(config_path()) {
+        if let Ok(cfg) = serde_json::from_str::<Value>(&raw) {
+            if let Some(projects) = cfg.get("projects").and_then(|p| p.as_object()) {
+                for (path, _) in projects {
+                    encoded_to_path.insert(encode_project_path(path), path.clone());
+                }
+            }
+        }
+    }
+    let mut projects = Vec::new();
+    let dirs = match fs::read_dir(&root) {
+        Ok(d) => d,
+        Err(_) => return ListMemoriesResult { projects },
+    };
+    for entry in dirs.flatten() {
+        let project_dir = entry.path();
+        if !project_dir.is_dir() { continue; }
+        let mem_dir = project_dir.join("memory");
+        if !mem_dir.is_dir() { continue; }
+        let encoded = entry.file_name().to_string_lossy().into_owned();
+        let dir_mtime_ms = mem_dir.metadata().ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64).unwrap_or(0);
+        let mut files = Vec::new();
+        if let Ok(items) = fs::read_dir(&mem_dir) {
+            for f in items.flatten() {
+                let p = f.path();
+                let name = f.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') { continue; } // skip hidden / lock files
+                if p.extension().and_then(|s| s.to_str()) != Some("md") { continue; }
+                let raw = match fs::read_to_string(&p) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let (fm, body) = parse_frontmatter(&raw);
+                let meta = match f.metadata() { Ok(m) => m, Err(_) => continue };
+                let mtime_ms = meta.modified().ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as i64).unwrap_or(0);
+                let mtime = meta.modified().ok()
+                    .map(|t| DateTime::<Local>::from(t).to_rfc3339_opts(SecondsFormat::Secs, false))
+                    .unwrap_or_default();
+                let trimmed = body.trim();
+                let preview: String = trimmed.chars().take(220).collect();
+                files.push(MemoryFile {
+                    name: name.clone(),
+                    size: meta.len(),
+                    mtime,
+                    mtime_ms,
+                    frontmatter: fm,
+                    body_preview: preview,
+                    is_index: name == "MEMORY.md",
+                });
+            }
+        }
+        if files.is_empty() { continue; }
+        // Sort: index file last, others by mtime desc.
+        files.sort_by(|a, b| {
+            match (a.is_index, b.is_index) {
+                (true, false) => std::cmp::Ordering::Greater,
+                (false, true) => std::cmp::Ordering::Less,
+                _ => b.mtime_ms.cmp(&a.mtime_ms),
+            }
+        });
+        let project_path = encoded_to_path.get(&encoded).cloned();
+        projects.push(MemoryProject {
+            project_path,
+            encoded_dir: encoded,
+            dir_path: mem_dir.to_string_lossy().into_owned(),
+            dir_mtime_ms,
+            files,
+        });
+    }
+    projects.sort_by(|a, b| b.dir_mtime_ms.cmp(&a.dir_mtime_ms));
+    ListMemoriesResult { projects }
+}
+
+#[derive(Deserialize)]
+struct ReadMemoryArgs {
+    #[serde(rename = "encodedDir")]
+    encoded_dir: String,
+    name: String,
+}
+
+#[derive(Serialize)]
+struct ReadMemoryResult {
+    raw: String,
+    frontmatter: Map<String, Value>,
+    body: String,
+}
+
+fn is_safe_memory_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains("..")
+        && name.ends_with(".md")
+}
+
+#[tauri::command]
+fn read_memory(args: ReadMemoryArgs) -> Result<ReadMemoryResult, String> {
+    if !is_safe_memory_name(&args.name) {
+        return Err("Invalid memory file name".into());
+    }
+    if args.encoded_dir.contains('/') || args.encoded_dir.contains("..") {
+        return Err("Invalid project dir".into());
+    }
+    let p = sessions_root().join(&args.encoded_dir).join("memory").join(&args.name);
+    if !p.is_file() {
+        return Err("Memory not found".into());
+    }
+    let raw = fs::read_to_string(&p).map_err(|e| format!("read failed: {e}"))?;
+    let (fm, body) = parse_frontmatter(&raw);
+    Ok(ReadMemoryResult { raw, frontmatter: fm, body })
+}
+
+#[derive(Deserialize)]
+struct DeleteMemoryArgs {
+    #[serde(rename = "encodedDir")]
+    encoded_dir: String,
+    name: String,
+}
+
+#[tauri::command]
+fn delete_memory(args: DeleteMemoryArgs) -> Result<Value, String> {
+    if !is_safe_memory_name(&args.name) {
+        return Err("Invalid memory file name".into());
+    }
+    if args.encoded_dir.contains('/') || args.encoded_dir.contains("..") {
+        return Err("Invalid project dir".into());
+    }
+    let p = sessions_root().join(&args.encoded_dir).join("memory").join(&args.name);
+    if !p.is_file() {
+        return Err("Memory not found".into());
+    }
+    let _ = ensure_backup_dir();
+    let backup_name = format!("memory-{}-{}-{}", args.encoded_dir, args.name, now_stamp());
+    let _ = fs::copy(&p, backup_dir().join(&backup_name));
+    fs::remove_file(&p).map_err(|e| format!("delete failed: {e}"))?;
+    Ok(serde_json::json!({ "ok": true, "backup": backup_name }))
+}
+
 #[derive(Deserialize)]
 struct OpenTerminalArgs {
     path: String,
@@ -1022,6 +1203,9 @@ pub fn run() {
             delete_session,
             list_project_images,
             open_terminal,
+            list_memories,
+            read_memory,
+            delete_memory,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
