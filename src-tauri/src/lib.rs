@@ -592,6 +592,116 @@ fn list_sessions(args: ListSessionsArgs) -> ListSessionsResult {
     ListSessionsResult { encoded_dir, exists: true, items }
 }
 
+fn plugins_root() -> PathBuf {
+    home().join(".claude").join("plugins").join("marketplaces")
+}
+
+#[derive(Serialize)]
+struct PluginHookEvent {
+    name: String,
+    matcher: Option<String>,
+    #[serde(rename = "hookCount")]
+    hook_count: usize,
+    commands: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct PluginHook {
+    marketplace: String,
+    plugin: String,
+    #[serde(rename = "pluginId")]
+    plugin_id: String,
+    description: Option<String>,
+    events: Vec<PluginHookEvent>,
+    #[serde(rename = "totalHooks")]
+    total_hooks: usize,
+    #[serde(rename = "hooksPath")]
+    hooks_path: String,
+}
+
+#[derive(Serialize)]
+struct ListPluginHooksResult {
+    items: Vec<PluginHook>,
+}
+
+#[tauri::command]
+fn list_plugin_hooks() -> ListPluginHooksResult {
+    let root = plugins_root();
+    let mut items: Vec<PluginHook> = Vec::new();
+    let marketplaces = match fs::read_dir(&root) {
+        Ok(m) => m,
+        Err(_) => return ListPluginHooksResult { items },
+    };
+    for mkt in marketplaces.flatten() {
+        let mkt_dir = mkt.path();
+        if !mkt_dir.is_dir() { continue; }
+        let mkt_name = mkt.file_name().to_string_lossy().into_owned();
+        let plugins_dir = mkt_dir.join("plugins");
+        if !plugins_dir.is_dir() { continue; }
+        let plugins = match fs::read_dir(&plugins_dir) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        for plugin in plugins.flatten() {
+            let plugin_dir = plugin.path();
+            if !plugin_dir.is_dir() { continue; }
+            let plugin_name = plugin.file_name().to_string_lossy().into_owned();
+            let hooks_path = plugin_dir.join("hooks").join("hooks.json");
+            if !hooks_path.is_file() { continue; }
+            let raw = match fs::read_to_string(&hooks_path) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let parsed: Value = match serde_json::from_str(&raw) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let description = parsed.get("description").and_then(|d| d.as_str()).map(String::from);
+            let mut events: Vec<PluginHookEvent> = Vec::new();
+            let mut total = 0usize;
+            if let Some(hooks_obj) = parsed.get("hooks").and_then(|h| h.as_object()) {
+                for (event_name, val) in hooks_obj {
+                    if let Some(arr) = val.as_array() {
+                        for matcher_entry in arr {
+                            let matcher = matcher_entry.get("matcher")
+                                .and_then(|m| m.as_str())
+                                .map(String::from);
+                            let mut commands = Vec::new();
+                            if let Some(hook_arr) = matcher_entry.get("hooks").and_then(|h| h.as_array()) {
+                                for h in hook_arr {
+                                    if let Some(cmd) = h.get("command").and_then(|c| c.as_str()) {
+                                        commands.push(cmd.to_string());
+                                    }
+                                }
+                            }
+                            total += commands.len();
+                            events.push(PluginHookEvent {
+                                name: event_name.clone(),
+                                matcher,
+                                hook_count: commands.len(),
+                                commands,
+                            });
+                        }
+                    }
+                }
+            }
+            if events.is_empty() { continue; }
+            let plugin_id = format!("{}@{}", plugin_name, mkt_name);
+            items.push(PluginHook {
+                marketplace: mkt_name.clone(),
+                plugin: plugin_name,
+                plugin_id,
+                description,
+                events,
+                total_hooks: total,
+                hooks_path: hooks_path.to_string_lossy().into_owned(),
+            });
+        }
+    }
+    items.sort_by(|a, b| a.plugin_id.cmp(&b.plugin_id));
+    ListPluginHooksResult { items }
+}
+
 #[derive(Serialize)]
 struct MemoryFile {
     name: String,
@@ -1206,6 +1316,7 @@ pub fn run() {
             list_memories,
             read_memory,
             delete_memory,
+            list_plugin_hooks,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
