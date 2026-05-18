@@ -33,39 +33,46 @@ fn encode_project_path(path: &str) -> String {
         .collect()
 }
 
-fn extract_first_user_prompt(jsonl: &str) -> Option<String> {
-    for line in jsonl.lines() {
-        let v: Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if v.get("type").and_then(|t| t.as_str()) != Some("user") {
-            continue;
-        }
-        let content = v.get("message").and_then(|m| m.get("content"))?;
-        let text = if let Some(s) = content.as_str() {
-            s.to_string()
-        } else if let Some(arr) = content.as_array() {
-            arr.iter()
-                .find_map(|b| {
-                    if b.get("type").and_then(|t| t.as_str()) == Some("text") {
-                        b.get("text").and_then(|t| t.as_str()).map(String::from)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
-        let trimmed = text.trim();
-        if trimmed.is_empty() || trimmed.starts_with('<') {
-            continue;
-        }
-        let truncated: String = trimmed.chars().take(200).collect();
-        return Some(truncated);
+fn extract_user_prompt_text(line: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(line).ok()?;
+    if v.get("type").and_then(|t| t.as_str()) != Some("user") {
+        return None;
     }
-    None
+    let content = v.get("message").and_then(|m| m.get("content"))?;
+    let text = if let Some(s) = content.as_str() {
+        s.to_string()
+    } else if let Some(arr) = content.as_array() {
+        arr.iter()
+            .find_map(|b| {
+                if b.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    b.get("text").and_then(|t| t.as_str()).map(String::from)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.starts_with('<') {
+        return None;
+    }
+    Some(trimmed.chars().take(200).collect())
+}
+
+fn extract_first_and_last_user_prompts(jsonl: &str) -> (Option<String>, Option<String>) {
+    let mut first: Option<String> = None;
+    let mut last: Option<String> = None;
+    for line in jsonl.lines() {
+        if let Some(p) = extract_user_prompt_text(line) {
+            if first.is_none() {
+                first = Some(p.clone());
+            }
+            last = Some(p);
+        }
+    }
+    (first, last)
 }
 
 fn ensure_backup_dir() -> std::io::Result<()> {
@@ -534,6 +541,8 @@ struct SessionInfo {
     size: u64,
     #[serde(rename = "firstPrompt")]
     first_prompt: Option<String>,
+    #[serde(rename = "lastPrompt")]
+    last_prompt: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -576,15 +585,17 @@ fn list_sessions(args: ListSessionsArgs) -> ListSessionsResult {
             let mtime = modified
                 .map(|t| DateTime::<Local>::from(t).to_rfc3339_opts(SecondsFormat::Secs, false))
                 .unwrap_or_default();
-            let first_prompt = fs::read_to_string(&path)
+            let (first_prompt, last_prompt) = fs::read_to_string(&path)
                 .ok()
-                .and_then(|raw| extract_first_user_prompt(&raw));
+                .map(|raw| extract_first_and_last_user_prompts(&raw))
+                .unwrap_or((None, None));
             items.push(SessionInfo {
                 id,
                 mtime,
                 mtime_ms,
                 size: meta.len(),
                 first_prompt,
+                last_prompt,
             });
         }
     }
