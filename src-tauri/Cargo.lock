@@ -334,7 +334,7 @@ dependencies = [
 
 [[package]]
 name = "claude-json-editor"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "chrono",
  "dirs 5.0.1",

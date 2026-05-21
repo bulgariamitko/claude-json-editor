@@ -614,6 +614,10 @@ struct FindSessionsByIdMatch {
     path: String,
     #[serde(rename = "sessionIds")]
     session_ids: Vec<String>,
+    #[serde(rename = "encodedDir")]
+    encoded_dir: String,
+    #[serde(rename = "orphan")]
+    orphan: bool,
 }
 
 #[derive(Serialize)]
@@ -628,31 +632,50 @@ fn find_sessions_by_id(args: FindSessionsByIdArgs) -> FindSessionsByIdResult {
         return FindSessionsByIdResult { items: Vec::new() };
     }
     let root = sessions_root();
+    let mut encoded_to_path: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for p in &args.paths {
+        encoded_to_path.insert(encode_project_path(p), p.clone());
+    }
     let mut items: Vec<FindSessionsByIdMatch> = Vec::new();
-    for path in args.paths {
-        let encoded = encode_project_path(&path);
-        let dir = root.join(&encoded);
+    let entries = match fs::read_dir(&root) {
+        Ok(e) => e,
+        Err(_) => return FindSessionsByIdResult { items },
+    };
+    for dir_entry in entries.flatten() {
+        let dir = dir_entry.path();
         if !dir.is_dir() {
             continue;
         }
+        let encoded = dir_entry.file_name().to_string_lossy().into_owned();
         let mut ids: Vec<String> = Vec::new();
-        if let Ok(entries) = fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+        if let Ok(files) = fs::read_dir(&dir) {
+            for f in files.flatten() {
+                let fp = f.path();
+                if fp.extension().and_then(|s| s.to_str()) != Some("jsonl") {
                     continue;
                 }
-                if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                if let Some(stem) = fp.file_stem().and_then(|s| s.to_str()) {
                     if stem.to_lowercase().contains(&q) {
                         ids.push(stem.to_string());
                     }
                 }
             }
         }
-        if !ids.is_empty() {
-            ids.sort();
-            items.push(FindSessionsByIdMatch { path, session_ids: ids });
+        if ids.is_empty() {
+            continue;
         }
+        ids.sort();
+        let (path, orphan) = match encoded_to_path.get(&encoded) {
+            Some(p) => (p.clone(), false),
+            None => (encoded.clone(), true),
+        };
+        items.push(FindSessionsByIdMatch {
+            path,
+            session_ids: ids,
+            encoded_dir: encoded,
+            orphan,
+        });
     }
     FindSessionsByIdResult { items }
 }
