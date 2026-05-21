@@ -618,6 +618,35 @@ struct FindSessionsByIdMatch {
     encoded_dir: String,
     #[serde(rename = "orphan")]
     orphan: bool,
+    #[serde(rename = "resolvedCwd", skip_serializing_if = "Option::is_none")]
+    resolved_cwd: Option<String>,
+}
+
+fn extract_cwd_from_jsonl(path: &Path) -> Option<String> {
+    let f = fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(f);
+    use std::io::BufRead;
+    for (i, line) in reader.lines().enumerate() {
+        if i > 100 {
+            break;
+        }
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
+            if let Some(cwd) = v.get("cwd").and_then(|x| x.as_str()) {
+                if !cwd.is_empty() {
+                    return Some(cwd.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 #[derive(Serialize)]
@@ -670,11 +699,20 @@ fn find_sessions_by_id(args: FindSessionsByIdArgs) -> FindSessionsByIdResult {
             Some(p) => (p.clone(), false),
             None => (encoded.clone(), true),
         };
+        let resolved_cwd = if orphan {
+            ids.first().and_then(|sid| {
+                let fpath = dir.join(format!("{}.jsonl", sid));
+                extract_cwd_from_jsonl(&fpath)
+            })
+        } else {
+            None
+        };
         items.push(FindSessionsByIdMatch {
             path,
             session_ids: ids,
             encoded_dir: encoded,
             orphan,
+            resolved_cwd,
         });
     }
     FindSessionsByIdResult { items }
