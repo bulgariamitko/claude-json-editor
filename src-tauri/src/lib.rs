@@ -603,6 +603,60 @@ fn list_sessions(args: ListSessionsArgs) -> ListSessionsResult {
     ListSessionsResult { encoded_dir, exists: true, items }
 }
 
+#[derive(Deserialize)]
+struct FindSessionsByIdArgs {
+    query: String,
+    paths: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct FindSessionsByIdMatch {
+    path: String,
+    #[serde(rename = "sessionIds")]
+    session_ids: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct FindSessionsByIdResult {
+    items: Vec<FindSessionsByIdMatch>,
+}
+
+#[tauri::command]
+fn find_sessions_by_id(args: FindSessionsByIdArgs) -> FindSessionsByIdResult {
+    let q = args.query.trim().to_lowercase();
+    if q.is_empty() {
+        return FindSessionsByIdResult { items: Vec::new() };
+    }
+    let root = sessions_root();
+    let mut items: Vec<FindSessionsByIdMatch> = Vec::new();
+    for path in args.paths {
+        let encoded = encode_project_path(&path);
+        let dir = root.join(&encoded);
+        if !dir.is_dir() {
+            continue;
+        }
+        let mut ids: Vec<String> = Vec::new();
+        if let Ok(entries) = fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                    if stem.to_lowercase().contains(&q) {
+                        ids.push(stem.to_string());
+                    }
+                }
+            }
+        }
+        if !ids.is_empty() {
+            ids.sort();
+            items.push(FindSessionsByIdMatch { path, session_ids: ids });
+        }
+    }
+    FindSessionsByIdResult { items }
+}
+
 fn plugins_root() -> PathBuf {
     home().join(".claude").join("plugins").join("marketplaces")
 }
@@ -1320,6 +1374,7 @@ pub fn run() {
             skill_write,
             skill_delete,
             list_sessions,
+            find_sessions_by_id,
             search_sessions,
             delete_session,
             list_project_images,
