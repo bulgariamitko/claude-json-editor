@@ -620,6 +620,60 @@ struct FindSessionsByIdMatch {
     orphan: bool,
     #[serde(rename = "resolvedCwd", skip_serializing_if = "Option::is_none")]
     resolved_cwd: Option<String>,
+    #[serde(rename = "aliases", skip_serializing_if = "HashMap::is_empty")]
+    aliases: HashMap<String, Vec<String>>,
+}
+
+fn find_unescaped_quote(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'"' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn extract_matching_aliases(path: &Path, query_lower: &str) -> Vec<String> {
+    let meta = match fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return Vec::new(),
+    };
+    if meta.len() > 50 * 1024 * 1024 {
+        return Vec::new();
+    }
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let mut found: Vec<String> = Vec::new();
+    for marker in &["\"customTitle\":\"", "\"agentName\":\""] {
+        let mut cursor = 0usize;
+        while let Some(idx) = content[cursor..].find(marker) {
+            let start = cursor + idx + marker.len();
+            let rest = &content[start..];
+            match find_unescaped_quote(rest) {
+                Some(end) => {
+                    let val = &rest[..end];
+                    if !val.is_empty()
+                        && val.to_lowercase().contains(query_lower)
+                        && !found.iter().any(|x| x == val)
+                    {
+                        found.push(val.to_string());
+                    }
+                    cursor = start + end + 1;
+                }
+                None => break,
+            }
+        }
+    }
+    found
 }
 
 fn extract_cwd_from_jsonl(path: &Path) -> Option<String> {
@@ -678,16 +732,26 @@ fn find_sessions_by_id(args: FindSessionsByIdArgs) -> FindSessionsByIdResult {
         }
         let encoded = dir_entry.file_name().to_string_lossy().into_owned();
         let mut ids: Vec<String> = Vec::new();
+        let mut aliases: HashMap<String, Vec<String>> = HashMap::new();
         if let Ok(files) = fs::read_dir(&dir) {
             for f in files.flatten() {
                 let fp = f.path();
                 if fp.extension().and_then(|s| s.to_str()) != Some("jsonl") {
                     continue;
                 }
-                if let Some(stem) = fp.file_stem().and_then(|s| s.to_str()) {
-                    if stem.to_lowercase().contains(&q) {
-                        ids.push(stem.to_string());
-                    }
+                let stem = match fp.file_stem().and_then(|s| s.to_str()) {
+                    Some(s) => s.to_string(),
+                    None => continue,
+                };
+                let stem_match = stem.to_lowercase().contains(&q);
+                if stem_match {
+                    ids.push(stem);
+                    continue;
+                }
+                let matched_aliases = extract_matching_aliases(&fp, &q);
+                if !matched_aliases.is_empty() {
+                    aliases.insert(stem.clone(), matched_aliases);
+                    ids.push(stem);
                 }
             }
         }
@@ -713,6 +777,7 @@ fn find_sessions_by_id(args: FindSessionsByIdArgs) -> FindSessionsByIdResult {
             encoded_dir: encoded,
             orphan,
             resolved_cwd,
+            aliases,
         });
     }
     FindSessionsByIdResult { items }
