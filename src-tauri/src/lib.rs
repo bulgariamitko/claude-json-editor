@@ -783,6 +783,125 @@ fn find_sessions_by_id(args: FindSessionsByIdArgs) -> FindSessionsByIdResult {
     FindSessionsByIdResult { items }
 }
 
+fn extract_all_aliases(path: &Path) -> Vec<String> {
+    let meta = match fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return Vec::new(),
+    };
+    if meta.len() > 50 * 1024 * 1024 {
+        return Vec::new();
+    }
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let mut found: Vec<String> = Vec::new();
+    for marker in &["\"customTitle\":\"", "\"agentName\":\""] {
+        let mut cursor = 0usize;
+        while let Some(idx) = content[cursor..].find(marker) {
+            let start = cursor + idx + marker.len();
+            let rest = &content[start..];
+            match find_unescaped_quote(rest) {
+                Some(end) => {
+                    let val = &rest[..end];
+                    if !val.is_empty() && !found.iter().any(|x| x == val) {
+                        found.push(val.to_string());
+                    }
+                    cursor = start + end + 1;
+                }
+                None => break,
+            }
+        }
+    }
+    found
+}
+
+#[derive(Deserialize)]
+struct ListAliasedSessionsArgs {
+    paths: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct ListAliasedSessionsMatch {
+    path: String,
+    #[serde(rename = "encodedDir")]
+    encoded_dir: String,
+    #[serde(rename = "orphan")]
+    orphan: bool,
+    #[serde(rename = "resolvedCwd", skip_serializing_if = "Option::is_none")]
+    resolved_cwd: Option<String>,
+    aliases: HashMap<String, Vec<String>>,
+}
+
+#[derive(Serialize)]
+struct ListAliasedSessionsResult {
+    items: Vec<ListAliasedSessionsMatch>,
+}
+
+#[tauri::command]
+fn list_aliased_sessions(args: ListAliasedSessionsArgs) -> ListAliasedSessionsResult {
+    let root = sessions_root();
+    let mut encoded_to_path: HashMap<String, String> = HashMap::new();
+    for p in &args.paths {
+        encoded_to_path.insert(encode_project_path(p), p.clone());
+    }
+    let mut items: Vec<ListAliasedSessionsMatch> = Vec::new();
+    let entries = match fs::read_dir(&root) {
+        Ok(e) => e,
+        Err(_) => return ListAliasedSessionsResult { items },
+    };
+    for dir_entry in entries.flatten() {
+        let dir = dir_entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let encoded = dir_entry.file_name().to_string_lossy().into_owned();
+        let mut aliases: HashMap<String, Vec<String>> = HashMap::new();
+        let mut first_session_with_alias: Option<String> = None;
+        if let Ok(files) = fs::read_dir(&dir) {
+            for f in files.flatten() {
+                let fp = f.path();
+                if fp.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                let stem = match fp.file_stem().and_then(|s| s.to_str()) {
+                    Some(s) => s.to_string(),
+                    None => continue,
+                };
+                let als = extract_all_aliases(&fp);
+                if !als.is_empty() {
+                    if first_session_with_alias.is_none() {
+                        first_session_with_alias = Some(stem.clone());
+                    }
+                    aliases.insert(stem, als);
+                }
+            }
+        }
+        if aliases.is_empty() {
+            continue;
+        }
+        let (path, orphan) = match encoded_to_path.get(&encoded) {
+            Some(p) => (p.clone(), false),
+            None => (encoded.clone(), true),
+        };
+        let resolved_cwd = if orphan {
+            first_session_with_alias
+                .as_ref()
+                .and_then(|sid| extract_cwd_from_jsonl(&dir.join(format!("{}.jsonl", sid))))
+        } else {
+            None
+        };
+        items.push(ListAliasedSessionsMatch {
+            path,
+            encoded_dir: encoded,
+            orphan,
+            resolved_cwd,
+            aliases,
+        });
+    }
+    ListAliasedSessionsResult { items }
+}
+
 fn plugins_root() -> PathBuf {
     home().join(".claude").join("plugins").join("marketplaces")
 }
@@ -1501,6 +1620,7 @@ pub fn run() {
             skill_delete,
             list_sessions,
             find_sessions_by_id,
+            list_aliased_sessions,
             search_sessions,
             delete_session,
             list_project_images,
