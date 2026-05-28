@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 
 use chrono::{DateTime, Local, SecondsFormat};
 use serde::{Deserialize, Serialize};
@@ -277,6 +279,31 @@ fn check_paths(paths: Vec<String>) -> HashMap<String, bool> {
     for p in paths {
         let exists = Path::new(&p).is_dir();
         out.insert(p, exists);
+    }
+    out
+}
+
+// Counts recorded session transcripts (*.jsonl) for each project path by scanning
+// its encoded dir under ~/.claude/projects. Cheap: a single readdir per path, no
+// file reads. A project with a config entry in .claude.json but 0 transcripts is
+// "config only".
+#[tauri::command]
+fn session_counts(paths: Vec<String>) -> HashMap<String, usize> {
+    let root = sessions_root();
+    let mut out = HashMap::with_capacity(paths.len());
+    for p in paths {
+        let dir = root.join(encode_project_path(&p));
+        let count = fs::read_dir(&dir)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|e| {
+                        e.path().extension().and_then(|s| s.to_str()) == Some("jsonl")
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        out.insert(p, count);
     }
     out
 }
@@ -730,6 +757,48 @@ fn current_alias(path: &Path) -> Option<String> {
     current_alias_from_content(&content)
 }
 
+/// Per-file alias cache keyed by modification time. Reading a 100+ session
+/// project to match aliases otherwise re-reads every transcript on each search;
+/// this reads each file at most once per on-disk version. New or modified files
+/// are detected via mtime and re-read automatically; the frontend Refresh clears
+/// the cache to force a clean rescan.
+fn alias_cache() -> &'static Mutex<HashMap<PathBuf, (SystemTime, Option<String>)>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, (SystemTime, Option<String>)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn clear_alias_cache_internal() {
+    if let Ok(mut c) = alias_cache().lock() {
+        c.clear();
+    }
+}
+
+/// mtime-cached wrapper around [`current_alias`]. Returns the cached value when
+/// the file is unchanged; otherwise reads it, caches the result, and returns it.
+fn current_alias_cached(path: &Path) -> Option<String> {
+    let mtime = match fs::metadata(path).and_then(|m| m.modified()) {
+        Ok(t) => t,
+        Err(_) => return current_alias(path),
+    };
+    if let Ok(cache) = alias_cache().lock() {
+        if let Some((cached_mtime, val)) = cache.get(path) {
+            if *cached_mtime == mtime {
+                return val.clone();
+            }
+        }
+    }
+    let alias = current_alias(path);
+    if let Ok(mut cache) = alias_cache().lock() {
+        cache.insert(path.to_path_buf(), (mtime, alias.clone()));
+    }
+    alias
+}
+
+#[tauri::command]
+fn clear_alias_cache() {
+    clear_alias_cache_internal();
+}
+
 fn extract_cwd_from_jsonl(path: &Path) -> Option<String> {
     let f = fs::File::open(path).ok()?;
     let reader = std::io::BufReader::new(f);
@@ -802,7 +871,7 @@ fn find_sessions_by_id(args: FindSessionsByIdArgs) -> FindSessionsByIdResult {
                     ids.push(stem);
                     continue;
                 }
-                if let Some(alias) = current_alias(&fp) {
+                if let Some(alias) = current_alias_cached(&fp) {
                     if alias.to_lowercase().contains(&q) {
                         aliases.insert(stem.clone(), alias);
                         ids.push(stem);
@@ -890,7 +959,7 @@ fn list_aliased_sessions(args: ListAliasedSessionsArgs) -> ListAliasedSessionsRe
                     Some(s) => s.to_string(),
                     None => continue,
                 };
-                if let Some(alias) = current_alias(&fp) {
+                if let Some(alias) = current_alias_cached(&fp) {
                     if first_session_with_alias.is_none() {
                         first_session_with_alias = Some(stem.clone());
                     }
@@ -1631,6 +1700,8 @@ pub fn run() {
             load,
             save,
             check_paths,
+            session_counts,
+            clear_alias_cache,
             backups,
             restore,
             settings_load,
