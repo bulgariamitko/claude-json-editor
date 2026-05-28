@@ -33,8 +33,7 @@ fn encode_project_path(path: &str) -> String {
         .collect()
 }
 
-fn extract_user_prompt_text(line: &str) -> Option<String> {
-    let v: Value = serde_json::from_str(line).ok()?;
+fn user_prompt_from_value(v: &Value) -> Option<String> {
     if v.get("type").and_then(|t| t.as_str()) != Some("user") {
         return None;
     }
@@ -61,18 +60,47 @@ fn extract_user_prompt_text(line: &str) -> Option<String> {
     Some(trimmed.chars().take(200).collect())
 }
 
-fn extract_first_and_last_user_prompts(jsonl: &str) -> (Option<String>, Option<String>) {
-    let mut first: Option<String> = None;
-    let mut last: Option<String> = None;
+fn parse_ts_ms(s: &str) -> Option<i64> {
+    DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.timestamp_millis())
+}
+
+struct SessionMeta {
+    first_prompt: Option<String>,
+    last_prompt: Option<String>,
+    created_ms: Option<i64>,
+    last_activity_ms: Option<i64>,
+}
+
+fn extract_session_meta(jsonl: &str) -> SessionMeta {
+    let mut first_prompt: Option<String> = None;
+    let mut last_prompt: Option<String> = None;
+    let mut created_ms: Option<i64> = None;
+    let mut last_activity_ms: Option<i64> = None;
     for line in jsonl.lines() {
-        if let Some(p) = extract_user_prompt_text(line) {
-            if first.is_none() {
-                first = Some(p.clone());
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let v: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(ms) = v.get("timestamp").and_then(|t| t.as_str()).and_then(parse_ts_ms) {
+            if created_ms.is_none() {
+                created_ms = Some(ms);
             }
-            last = Some(p);
+            last_activity_ms = Some(ms);
+        }
+        if let Some(p) = user_prompt_from_value(&v) {
+            if first_prompt.is_none() {
+                first_prompt = Some(p.clone());
+            }
+            last_prompt = Some(p);
         }
     }
-    (first, last)
+    SessionMeta { first_prompt, last_prompt, created_ms, last_activity_ms }
 }
 
 fn ensure_backup_dir() -> std::io::Result<()> {
@@ -538,6 +566,10 @@ struct SessionInfo {
     mtime: String,
     #[serde(rename = "mtimeMs")]
     mtime_ms: i64,
+    #[serde(rename = "createdMs")]
+    created_ms: i64,
+    #[serde(rename = "lastActivityMs")]
+    last_activity_ms: i64,
     size: u64,
     #[serde(rename = "firstPrompt")]
     first_prompt: Option<String>,
@@ -585,21 +617,38 @@ fn list_sessions(args: ListSessionsArgs) -> ListSessionsResult {
             let mtime = modified
                 .map(|t| DateTime::<Local>::from(t).to_rfc3339_opts(SecondsFormat::Secs, false))
                 .unwrap_or_default();
-            let (first_prompt, last_prompt) = fs::read_to_string(&path)
+            let created_fallback = meta
+                .created()
                 .ok()
-                .map(|raw| extract_first_and_last_user_prompts(&raw))
-                .unwrap_or((None, None));
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(mtime_ms);
+            let sm = fs::read_to_string(&path)
+                .ok()
+                .map(|raw| extract_session_meta(&raw))
+                .unwrap_or(SessionMeta {
+                    first_prompt: None,
+                    last_prompt: None,
+                    created_ms: None,
+                    last_activity_ms: None,
+                });
+            // Prefer timestamps recorded inside the transcript (authoritative);
+            // fall back to filesystem times when the JSONL has none.
+            let created_ms = sm.created_ms.unwrap_or(created_fallback);
+            let last_activity_ms = sm.last_activity_ms.unwrap_or(mtime_ms);
             items.push(SessionInfo {
                 id,
                 mtime,
                 mtime_ms,
+                created_ms,
+                last_activity_ms,
                 size: meta.len(),
-                first_prompt,
-                last_prompt,
+                first_prompt: sm.first_prompt,
+                last_prompt: sm.last_prompt,
             });
         }
     }
-    items.sort_by(|a, b| b.mtime_ms.cmp(&a.mtime_ms));
+    items.sort_by(|a, b| b.last_activity_ms.cmp(&a.last_activity_ms));
     ListSessionsResult { encoded_dir, exists: true, items }
 }
 
