@@ -670,7 +670,7 @@ struct FindSessionsByIdMatch {
     #[serde(rename = "resolvedCwd", skip_serializing_if = "Option::is_none")]
     resolved_cwd: Option<String>,
     #[serde(rename = "aliases", skip_serializing_if = "HashMap::is_empty")]
-    aliases: HashMap<String, Vec<String>>,
+    aliases: HashMap<String, String>,
 }
 
 fn find_unescaped_quote(s: &str) -> Option<usize> {
@@ -689,40 +689,45 @@ fn find_unescaped_quote(s: &str) -> Option<usize> {
     None
 }
 
-fn extract_matching_aliases(path: &Path, query_lower: &str) -> Vec<String> {
-    let meta = match fs::metadata(path) {
-        Ok(m) => m,
-        Err(_) => return Vec::new(),
-    };
-    if meta.len() > 50 * 1024 * 1024 {
-        return Vec::new();
-    }
-    let content = match fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
-    let mut found: Vec<String> = Vec::new();
-    for marker in &["\"customTitle\":\"", "\"agentName\":\""] {
-        let mut cursor = 0usize;
-        while let Some(idx) = content[cursor..].find(marker) {
-            let start = cursor + idx + marker.len();
-            let rest = &content[start..];
-            match find_unescaped_quote(rest) {
-                Some(end) => {
-                    let val = &rest[..end];
-                    if !val.is_empty()
-                        && val.to_lowercase().contains(query_lower)
-                        && !found.iter().any(|x| x == val)
-                    {
-                        found.push(val.to_string());
-                    }
-                    cursor = start + end + 1;
+/// Returns the value of the LAST occurrence of `marker` (a JSON key prefix like
+/// `"customTitle":"`) in `content`, i.e. the most recent value written.
+fn last_marker_value(content: &str, marker: &str) -> Option<String> {
+    let mut result = None;
+    let mut cursor = 0usize;
+    while let Some(idx) = content[cursor..].find(marker) {
+        let start = cursor + idx + marker.len();
+        let rest = &content[start..];
+        match find_unescaped_quote(rest) {
+            Some(end) => {
+                let val = &rest[..end];
+                if !val.is_empty() {
+                    result = Some(val.to_string());
                 }
-                None => break,
+                cursor = start + end + 1;
             }
+            None => break,
         }
     }
-    found
+    result
+}
+
+/// The session's *current* alias from raw transcript text: the most recent
+/// `customTitle` (falling back to the most recent `agentName`).
+fn current_alias_from_content(content: &str) -> Option<String> {
+    last_marker_value(content, "\"customTitle\":\"")
+        .or_else(|| last_marker_value(content, "\"agentName\":\""))
+}
+
+/// The session's *current* alias: the most recent `customTitle` (falling back to
+/// the most recent `agentName`). A session is renamed by appending new
+/// custom-title/agent-name entries, so the last one wins.
+fn current_alias(path: &Path) -> Option<String> {
+    let meta = fs::metadata(path).ok()?;
+    if meta.len() > 50 * 1024 * 1024 {
+        return None;
+    }
+    let content = fs::read_to_string(path).ok()?;
+    current_alias_from_content(&content)
 }
 
 fn extract_cwd_from_jsonl(path: &Path) -> Option<String> {
@@ -781,7 +786,7 @@ fn find_sessions_by_id(args: FindSessionsByIdArgs) -> FindSessionsByIdResult {
         }
         let encoded = dir_entry.file_name().to_string_lossy().into_owned();
         let mut ids: Vec<String> = Vec::new();
-        let mut aliases: HashMap<String, Vec<String>> = HashMap::new();
+        let mut aliases: HashMap<String, String> = HashMap::new();
         if let Ok(files) = fs::read_dir(&dir) {
             for f in files.flatten() {
                 let fp = f.path();
@@ -797,10 +802,11 @@ fn find_sessions_by_id(args: FindSessionsByIdArgs) -> FindSessionsByIdResult {
                     ids.push(stem);
                     continue;
                 }
-                let matched_aliases = extract_matching_aliases(&fp, &q);
-                if !matched_aliases.is_empty() {
-                    aliases.insert(stem.clone(), matched_aliases);
-                    ids.push(stem);
+                if let Some(alias) = current_alias(&fp) {
+                    if alias.to_lowercase().contains(&q) {
+                        aliases.insert(stem.clone(), alias);
+                        ids.push(stem);
+                    }
                 }
             }
         }
@@ -832,39 +838,6 @@ fn find_sessions_by_id(args: FindSessionsByIdArgs) -> FindSessionsByIdResult {
     FindSessionsByIdResult { items }
 }
 
-fn extract_all_aliases(path: &Path) -> Vec<String> {
-    let meta = match fs::metadata(path) {
-        Ok(m) => m,
-        Err(_) => return Vec::new(),
-    };
-    if meta.len() > 50 * 1024 * 1024 {
-        return Vec::new();
-    }
-    let content = match fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
-    let mut found: Vec<String> = Vec::new();
-    for marker in &["\"customTitle\":\"", "\"agentName\":\""] {
-        let mut cursor = 0usize;
-        while let Some(idx) = content[cursor..].find(marker) {
-            let start = cursor + idx + marker.len();
-            let rest = &content[start..];
-            match find_unescaped_quote(rest) {
-                Some(end) => {
-                    let val = &rest[..end];
-                    if !val.is_empty() && !found.iter().any(|x| x == val) {
-                        found.push(val.to_string());
-                    }
-                    cursor = start + end + 1;
-                }
-                None => break,
-            }
-        }
-    }
-    found
-}
-
 #[derive(Deserialize)]
 struct ListAliasedSessionsArgs {
     paths: Vec<String>,
@@ -879,7 +852,7 @@ struct ListAliasedSessionsMatch {
     orphan: bool,
     #[serde(rename = "resolvedCwd", skip_serializing_if = "Option::is_none")]
     resolved_cwd: Option<String>,
-    aliases: HashMap<String, Vec<String>>,
+    aliases: HashMap<String, String>,
 }
 
 #[derive(Serialize)]
@@ -905,7 +878,7 @@ fn list_aliased_sessions(args: ListAliasedSessionsArgs) -> ListAliasedSessionsRe
             continue;
         }
         let encoded = dir_entry.file_name().to_string_lossy().into_owned();
-        let mut aliases: HashMap<String, Vec<String>> = HashMap::new();
+        let mut aliases: HashMap<String, String> = HashMap::new();
         let mut first_session_with_alias: Option<String> = None;
         if let Ok(files) = fs::read_dir(&dir) {
             for f in files.flatten() {
@@ -917,12 +890,11 @@ fn list_aliased_sessions(args: ListAliasedSessionsArgs) -> ListAliasedSessionsRe
                     Some(s) => s.to_string(),
                     None => continue,
                 };
-                let als = extract_all_aliases(&fp);
-                if !als.is_empty() {
+                if let Some(alias) = current_alias(&fp) {
                     if first_session_with_alias.is_none() {
                         first_session_with_alias = Some(stem.clone());
                     }
-                    aliases.insert(stem, als);
+                    aliases.insert(stem, alias);
                 }
             }
         }
@@ -1681,4 +1653,115 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rename_line(title: &str) -> String {
+        format!(
+            "{{\"type\":\"custom-title\",\"customTitle\":\"{0}\",\"sessionId\":\"x\"}}\n{{\"type\":\"agent-name\",\"agentName\":\"{0}\",\"sessionId\":\"x\"}}",
+            title
+        )
+    }
+
+    #[test]
+    fn current_alias_returns_most_recent_rename() {
+        // Renamed twice: the LAST custom-title is the current alias.
+        let content = format!(
+            "{}\n{{\"type\":\"user\"}}\n{}\n",
+            rename_line("fix-color-consistency-typography"),
+            rename_line("implement-pre-order-feature")
+        );
+        assert_eq!(
+            current_alias_from_content(&content).as_deref(),
+            Some("implement-pre-order-feature")
+        );
+    }
+
+    #[test]
+    fn current_alias_falls_back_to_agent_name() {
+        let content = "{\"type\":\"agent-name\",\"agentName\":\"only-agent\"}\n";
+        assert_eq!(current_alias_from_content(content).as_deref(), Some("only-agent"));
+    }
+
+    #[test]
+    fn current_alias_none_when_unnamed() {
+        let content = "{\"type\":\"user\",\"message\":{\"content\":\"hi\"}}\n";
+        assert_eq!(current_alias_from_content(content), None);
+    }
+
+    #[test]
+    fn current_alias_prefers_custom_title_over_agent_name() {
+        // customTitle present anywhere wins over agentName fallback.
+        let content = "{\"agentName\":\"agent-x\"}\n{\"customTitle\":\"title-x\"}\n";
+        assert_eq!(current_alias_from_content(content).as_deref(), Some("title-x"));
+    }
+
+    #[test]
+    fn last_marker_value_picks_last_occurrence() {
+        let content = "{\"customTitle\":\"a\"}\n{\"customTitle\":\"b\"}\n{\"customTitle\":\"c\"}";
+        assert_eq!(
+            last_marker_value(content, "\"customTitle\":\"").as_deref(),
+            Some("c")
+        );
+    }
+
+    #[test]
+    fn timestamps_extracted_from_first_and_last_entry() {
+        let content = "{\"type\":\"x\",\"timestamp\":\"2026-05-26T13:15:11.652Z\"}\n\
+            {\"type\":\"user\",\"message\":{\"content\":\"hello\"},\"timestamp\":\"2026-05-27T09:00:00.000Z\"}\n\
+            {\"type\":\"x\",\"timestamp\":\"2026-05-28T07:51:20.016Z\"}\n";
+        let sm = extract_session_meta(content);
+        let created = parse_ts_ms("2026-05-26T13:15:11.652Z").unwrap();
+        let last = parse_ts_ms("2026-05-28T07:51:20.016Z").unwrap();
+        assert_eq!(sm.created_ms, Some(created));
+        assert_eq!(sm.last_activity_ms, Some(last));
+        assert_eq!(sm.first_prompt.as_deref(), Some("hello"));
+        assert_eq!(sm.last_prompt.as_deref(), Some("hello"));
+        assert!(last > created);
+    }
+
+    // Real-data smoke test for the search function. Ignored by default because it
+    // depends on the developer's own ~/.claude/projects. Run with:
+    //   cargo test -- --ignored
+    #[test]
+    #[ignore]
+    fn real_data_search_finds_renamed_session() {
+        let path = "/Users/dimitarklaturov/Library/CloudStorage/Dropbox/izdavam".to_string();
+        let sid_prefix = "66963662";
+        let current = "implement-pre-order-feature";
+        let old = "fix-color-consistency-typography";
+
+        // 1) by session-id prefix
+        let by_id = find_sessions_by_id(FindSessionsByIdArgs {
+            query: sid_prefix.to_string(),
+            paths: vec![path.clone()],
+        });
+        assert!(
+            by_id.items.iter().any(|m| m.session_ids.iter().any(|id| id.starts_with(sid_prefix))),
+            "session-id search should find the session"
+        );
+
+        // 2) by current alias -> matches and reports the current alias
+        let by_alias = find_sessions_by_id(FindSessionsByIdArgs {
+            query: "implement-pre-order".to_string(),
+            paths: vec![path.clone()],
+        });
+        assert!(
+            by_alias.items.iter().any(|m| m.aliases.values().any(|a| a == current)),
+            "alias search should match the current alias"
+        );
+
+        // 3) the renamed session must NOT surface under its OLD alias
+        let by_old = find_sessions_by_id(FindSessionsByIdArgs {
+            query: old.to_string(),
+            paths: vec![path],
+        });
+        assert!(
+            !by_old.items.iter().any(|m| m.session_ids.iter().any(|id| id.starts_with(sid_prefix))),
+            "old alias must not match the renamed session"
+        );
+    }
 }
