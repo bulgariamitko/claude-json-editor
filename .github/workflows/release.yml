@@ -22,9 +22,6 @@ jobs:
           - platform: macos-14
             args: '--target aarch64-apple-darwin'
             name: macOS (Apple Silicon)
-          - platform: macos-13
-            args: '--target x86_64-apple-darwin'
-            name: macOS (Intel)
           - platform: ubuntu-22.04
             args: ''
             name: Linux x64
@@ -45,7 +42,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.platform == 'macos-14' && 'aarch64-apple-darwin' || (matrix.platform == 'macos-13' && 'x86_64-apple-darwin' || '') }}
+          targets: ${{ matrix.platform == 'macos-14' && 'aarch64-apple-darwin' || '' }}
 
       - name: Cache Cargo registry
         uses: actions/cache@v4
