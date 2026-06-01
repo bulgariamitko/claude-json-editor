@@ -1375,6 +1375,212 @@ fn delete_session(args: DeleteSessionArgs) -> Result<Value, String> {
 }
 
 #[derive(Deserialize)]
+struct ReadTranscriptArgs {
+    path: Option<String>,
+    #[serde(rename = "encodedDir")]
+    encoded_dir: Option<String>,
+    #[serde(rename = "sessionId")]
+    session_id: String,
+}
+
+#[derive(Serialize)]
+struct TranscriptToolUse {
+    name: String,
+    input: Value,
+}
+
+#[derive(Serialize)]
+struct TranscriptMessage {
+    #[serde(rename = "lineNo")]
+    line_no: usize,
+    #[serde(rename = "type")]
+    typ: String,
+    role: Option<String>,
+    text: String,
+    ts: Option<String>,
+    #[serde(rename = "tsMs")]
+    ts_ms: Option<i64>,
+    thinking: Option<String>,
+    #[serde(rename = "toolUses")]
+    tool_uses: Vec<TranscriptToolUse>,
+    #[serde(rename = "toolResults")]
+    tool_results: Vec<String>,
+    #[serde(rename = "imageCount")]
+    image_count: usize,
+    truncated: bool,
+}
+
+#[derive(Serialize)]
+struct ReadTranscriptResult {
+    messages: Vec<TranscriptMessage>,
+    #[serde(rename = "sessionId")]
+    session_id: String,
+    bytes: u64,
+    truncated: bool,
+}
+
+// Per-block text cap to keep the modal responsive on huge tool outputs.
+const TRANSCRIPT_BLOCK_MAX: usize = 8000;
+
+fn cap_text(s: &str) -> (String, bool) {
+    if s.len() <= TRANSCRIPT_BLOCK_MAX {
+        (s.to_string(), false)
+    } else {
+        // Walk back to a char boundary
+        let mut end = TRANSCRIPT_BLOCK_MAX;
+        while end > 0 && !s.is_char_boundary(end) { end -= 1; }
+        (s[..end].to_string(), true)
+    }
+}
+
+fn collect_message_parts(content: &Value, out_text: &mut String, msg: &mut TranscriptMessage) {
+    if let Some(s) = content.as_str() {
+        let (capped, was_trunc) = cap_text(s);
+        if !out_text.is_empty() { out_text.push_str("\n"); }
+        out_text.push_str(&capped);
+        if was_trunc { msg.truncated = true; }
+        return;
+    }
+    if let Some(arr) = content.as_array() {
+        for b in arr {
+            let btyp = b.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            match btyp {
+                "text" => {
+                    if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                        let (capped, was_trunc) = cap_text(t);
+                        if !out_text.is_empty() { out_text.push_str("\n"); }
+                        out_text.push_str(&capped);
+                        if was_trunc { msg.truncated = true; }
+                    }
+                }
+                "thinking" => {
+                    if let Some(t) = b.get("thinking").and_then(|t| t.as_str()) {
+                        let (capped, was_trunc) = cap_text(t);
+                        let cur = msg.thinking.take().unwrap_or_default();
+                        let joined = if cur.is_empty() { capped } else { format!("{}\n{}", cur, capped) };
+                        msg.thinking = Some(joined);
+                        if was_trunc { msg.truncated = true; }
+                    }
+                }
+                "tool_use" => {
+                    let name = b.get("name").and_then(|n| n.as_str()).unwrap_or("?").to_string();
+                    let input = b.get("input").cloned().unwrap_or(Value::Null);
+                    msg.tool_uses.push(TranscriptToolUse { name, input });
+                }
+                "tool_result" => {
+                    let inner = b.get("content").unwrap_or(&Value::Null);
+                    let mut piece = String::new();
+                    if let Some(s) = inner.as_str() {
+                        piece.push_str(s);
+                    } else if let Some(arr2) = inner.as_array() {
+                        for sb in arr2 {
+                            if let Some(t) = sb.get("text").and_then(|t| t.as_str()) {
+                                if !piece.is_empty() { piece.push_str("\n"); }
+                                piece.push_str(t);
+                            } else if sb.get("type").and_then(|t| t.as_str()) == Some("image") {
+                                msg.image_count += 1;
+                            }
+                        }
+                    }
+                    let (capped, was_trunc) = cap_text(&piece);
+                    msg.tool_results.push(capped);
+                    if was_trunc { msg.truncated = true; }
+                }
+                "image" => {
+                    msg.image_count += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+#[tauri::command]
+fn read_session_transcript(args: ReadTranscriptArgs) -> Result<ReadTranscriptResult, String> {
+    if !args.session_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return Err("Invalid session id".into());
+    }
+    let encoded = if let Some(p) = args.path.as_ref() {
+        encode_project_path(p)
+    } else if let Some(d) = args.encoded_dir.as_ref() {
+        if !d.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
+            return Err("Invalid encoded dir".into());
+        }
+        d.clone()
+    } else {
+        return Err("path or encodedDir required".into());
+    };
+    let file = sessions_root().join(&encoded).join(format!("{}.jsonl", args.session_id));
+    if !file.is_file() {
+        return Err("Session file not found".into());
+    }
+    let bytes = fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
+    let raw = fs::read_to_string(&file).map_err(|e| format!("read failed: {e}"))?;
+
+    let mut messages: Vec<TranscriptMessage> = Vec::new();
+    let mut overall_trunc = false;
+    for (idx, line) in raw.lines().enumerate() {
+        if line.trim().is_empty() { continue; }
+        let v: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or("").to_string();
+        // Skip rename markers and snapshot entries — the modal is for reviewing messages.
+        if typ == "custom-title" || typ == "agent-name" { continue; }
+        let role = v.get("message").and_then(|m| m.get("role")).and_then(|r| r.as_str()).map(String::from);
+        let ts = v.get("timestamp").and_then(|t| t.as_str()).map(String::from);
+        let ts_ms = ts.as_deref().and_then(parse_ts_ms);
+        let mut msg = TranscriptMessage {
+            line_no: idx + 1,
+            typ: typ.clone(),
+            role,
+            text: String::new(),
+            ts,
+            ts_ms,
+            thinking: None,
+            tool_uses: Vec::new(),
+            tool_results: Vec::new(),
+            image_count: 0,
+            truncated: false,
+        };
+        let mut text = String::new();
+        if typ == "user" || typ == "assistant" {
+            if let Some(c) = v.get("message").and_then(|m| m.get("content")) {
+                collect_message_parts(c, &mut text, &mut msg);
+            }
+        } else if typ == "summary" {
+            if let Some(s) = v.get("summary").and_then(|s| s.as_str()) {
+                let (capped, was_trunc) = cap_text(s);
+                text = capped;
+                if was_trunc { msg.truncated = true; }
+            }
+        } else {
+            // Unknown type — skip to keep the view clean.
+            continue;
+        }
+        msg.text = text;
+        if msg.truncated { overall_trunc = true; }
+        // Drop fully-empty entries (no text, no tools, no thinking).
+        if msg.text.is_empty()
+            && msg.thinking.is_none()
+            && msg.tool_uses.is_empty()
+            && msg.tool_results.is_empty()
+            && msg.image_count == 0 {
+            continue;
+        }
+        messages.push(msg);
+    }
+
+    Ok(ReadTranscriptResult {
+        messages,
+        session_id: args.session_id,
+        bytes,
+        truncated: overall_trunc,
+    })
+}
+
+#[derive(Deserialize)]
 struct ListProjectImagesArgs {
     path: String,
     #[serde(rename = "maxImages")]
@@ -1715,6 +1921,7 @@ pub fn run() {
             list_aliased_sessions,
             search_sessions,
             delete_session,
+            read_session_transcript,
             list_project_images,
             open_terminal,
             list_memories,
@@ -1792,6 +1999,54 @@ mod tests {
         assert_eq!(sm.first_prompt.as_deref(), Some("hello"));
         assert_eq!(sm.last_prompt.as_deref(), Some("hello"));
         assert!(last > created);
+    }
+
+    #[test]
+    fn transcript_parts_split_text_thinking_and_tools() {
+        let content = serde_json::json!([
+            {"type": "thinking", "thinking": "let me think"},
+            {"type": "text", "text": "Here is my answer"},
+            {"type": "tool_use", "name": "Read", "input": {"file": "a.txt"}},
+        ]);
+        let mut msg = TranscriptMessage {
+            line_no: 1, typ: "assistant".into(), role: Some("assistant".into()),
+            text: String::new(), ts: None, ts_ms: None, thinking: None,
+            tool_uses: Vec::new(), tool_results: Vec::new(), image_count: 0, truncated: false,
+        };
+        let mut text = String::new();
+        collect_message_parts(&content, &mut text, &mut msg);
+        assert_eq!(text, "Here is my answer");
+        assert_eq!(msg.thinking.as_deref(), Some("let me think"));
+        assert_eq!(msg.tool_uses.len(), 1);
+        assert_eq!(msg.tool_uses[0].name, "Read");
+    }
+
+    #[test]
+    fn transcript_tool_result_and_image_counted() {
+        let content = serde_json::json!([
+            {"type": "tool_result", "content": [
+                {"type": "text", "text": "file contents"},
+                {"type": "image", "source": {"data": "..."}},
+            ]},
+        ]);
+        let mut msg = TranscriptMessage {
+            line_no: 1, typ: "user".into(), role: Some("user".into()),
+            text: String::new(), ts: None, ts_ms: None, thinking: None,
+            tool_uses: Vec::new(), tool_results: Vec::new(), image_count: 0, truncated: false,
+        };
+        let mut text = String::new();
+        collect_message_parts(&content, &mut text, &mut msg);
+        assert_eq!(msg.tool_results.len(), 1);
+        assert_eq!(msg.tool_results[0], "file contents");
+        assert_eq!(msg.image_count, 1);
+    }
+
+    #[test]
+    fn transcript_caps_huge_block() {
+        let big = "x".repeat(TRANSCRIPT_BLOCK_MAX + 500);
+        let (capped, truncated) = cap_text(&big);
+        assert!(truncated);
+        assert_eq!(capped.len(), TRANSCRIPT_BLOCK_MAX);
     }
 
     // Real-data smoke test for the search function. Ignored by default because it
