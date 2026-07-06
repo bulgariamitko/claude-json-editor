@@ -1895,9 +1895,73 @@ fn search_sessions(args: SearchSessionsArgs) -> SearchSessionsResult {
     SearchSessionsResult { hits, files_scanned, truncated }
 }
 
+// ------------------------------ Live change watching ------------------------------
+
+fn file_signature(path: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    if let Ok(md) = fs::metadata(path) {
+        md.len().hash(&mut h);
+        if let Ok(m) = md.modified() {
+            if let Ok(d) = m.duration_since(SystemTime::UNIX_EPOCH) {
+                d.as_nanos().hash(&mut h);
+            }
+        }
+    }
+    h.finish()
+}
+
+// Creating a session file bumps its project dir's mtime, and creating a project
+// dir changes the entry list, so hashing (name, mtime) per top-level entry
+// catches both without descending into the tree.
+fn sessions_signature(root: &Path) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    if let Ok(entries) = fs::read_dir(root) {
+        for entry in entries.flatten() {
+            entry.file_name().hash(&mut h);
+            if let Ok(md) = entry.metadata() {
+                if let Ok(m) = md.modified() {
+                    if let Ok(d) = m.duration_since(SystemTime::UNIX_EPOCH) {
+                        d.as_nanos().hash(&mut h);
+                    }
+                }
+            }
+        }
+    }
+    h.finish()
+}
+
+fn spawn_change_watcher(handle: tauri::AppHandle) {
+    use tauri::Emitter;
+    std::thread::spawn(move || {
+        let cfg = config_path();
+        let sessions = sessions_root();
+        let mut cfg_sig = file_signature(&cfg);
+        let mut sess_sig = sessions_signature(&sessions);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            let c = file_signature(&cfg);
+            if c != cfg_sig {
+                cfg_sig = c;
+                let _ = handle.emit("claude-json-changed", ());
+            }
+            let s = sessions_signature(&sessions);
+            if s != sess_sig {
+                sess_sig = s;
+                let _ = handle.emit("sessions-changed", ());
+            }
+        }
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .setup(|app| {
+            spawn_change_watcher(app.handle().clone());
+            Ok(())
+        })
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
